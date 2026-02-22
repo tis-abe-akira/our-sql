@@ -2,16 +2,10 @@
 oursql/engine.py
 SQLEngine: ties the SQL parser to OurSQLDB for execution.
 
-Usage:
-    from oursql.db import OurSQLDB
-    from oursql.engine import SQLEngine
-
-    db = OurSQLDB()
-    engine = SQLEngine(db)
-    engine.execute("CREATE TABLE users (id INT, name TEXT)")
-    engine.execute("INSERT INTO users VALUES (1, 'Alice')")
-    rows = engine.execute("SELECT * FROM users WHERE id = 1")
-    # → [{"id": 1, "name": "Alice"}]
+Supports:
+  - SELECT with WHERE (AND/OR/Predicate), ORDER BY [ASC|DESC], LIMIT
+  - INSERT, UPDATE, DELETE with compound WHERE
+  - CREATE TABLE, DROP TABLE
 """
 
 from __future__ import annotations
@@ -22,13 +16,14 @@ from oursql.parser import (
     parse,
     SelectStmt, InsertStmt, UpdateStmt, DeleteStmt,
     CreateTableStmt, DropTableStmt,
-    WhereClause,
+    Predicate, AndCondition, OrCondition,
+    Condition,
     ParseError,
 )
 
 
 class SQLError(Exception):
-    """Runtime SQL execution error (table not found, type mismatch, etc.)."""
+    """Runtime SQL execution error."""
 
 
 class SQLEngine:
@@ -45,7 +40,6 @@ class SQLEngine:
         self._db = db
 
     def execute(self, sql: str) -> list[dict] | dict:
-        """Parse and execute a SQL statement. Returns query results or status."""
         try:
             stmt = parse(sql)
         except ParseError as e:
@@ -71,22 +65,35 @@ class SQLEngine:
     def _exec_select(self, stmt: SelectStmt) -> list[dict]:
         table = self._get_table(stmt.table)
 
-        if stmt.where is not None:
-            # Optimise: if WHERE is on the primary key with =, use index
-            pk_col = table._pk_column
-            if stmt.where.column == pk_col and stmt.where.op == "=":
-                row = table.select(stmt.where.value)
-                rows = [row] if row is not None else []
-            else:
-                # Full scan + post-filter
-                rows = [r for r in table.select_all() if _matches(r, stmt.where)]
+        # === Row retrieval ===
+        # Optimise: simple PK equality → index lookup
+        if (
+            stmt.where is not None
+            and isinstance(stmt.where, Predicate)
+            and stmt.where.column == table._pk_column
+            and stmt.where.op == "="
+        ):
+            row = table.select(stmt.where.value)
+            rows = [row] if row is not None else []
         else:
             rows = table.select_all()
+            if stmt.where is not None:
+                rows = [r for r in rows if eval_condition(r, stmt.where)]
 
-        # Column projection
-        if stmt.columns == ["*"]:
-            return rows
-        return [{col: row.get(col) for col in stmt.columns} for row in rows]
+        # === Column projection ===
+        if stmt.columns != ["*"]:
+            rows = [{col: row.get(col) for col in stmt.columns} for row in rows]
+
+        # === ORDER BY ===
+        if stmt.order_by is not None:
+            reverse = stmt.order_dir == "DESC"
+            rows = sorted(rows, key=lambda r: (r.get(stmt.order_by) is None, r.get(stmt.order_by)), reverse=reverse)
+
+        # === LIMIT ===
+        if stmt.limit is not None:
+            rows = rows[: stmt.limit]
+
+        return rows
 
     # ── INSERT ────────────────────────────────────────────────────────
 
@@ -101,7 +108,7 @@ class SQLEngine:
             )
 
         row = {col: val for col, val in zip(schema_cols, stmt.values)}
-        # Coerce INT columns
+        # Coerce float→int for INT columns
         for col, col_type in table.schema.items():
             if col_type == "int" and isinstance(row.get(col), float):
                 row[col] = int(row[col])
@@ -117,17 +124,20 @@ class SQLEngine:
 
         if stmt.where is not None:
             pk_col = table._pk_column
-            # Optimise: PK equality → single row
-            if stmt.where.column == pk_col and stmt.where.op == "=":
+            # Optimise: simple PK equality
+            if (
+                isinstance(stmt.where, Predicate)
+                and stmt.where.column == pk_col
+                and stmt.where.op == "="
+            ):
                 ok = table.update(stmt.where.value, stmt.assignments)
                 affected = 1 if ok else 0
             else:
-                candidates = [r for r in table.select_all() if _matches(r, stmt.where)]
+                candidates = [r for r in table.select_all() if eval_condition(r, stmt.where)]
                 for row in candidates:
                     table.update(row[pk_col], stmt.assignments)
                     affected += 1
         else:
-            # No WHERE → update all rows
             for row in table.select_all():
                 table.update(row[table._pk_column], stmt.assignments)
                 affected += 1
@@ -142,11 +152,15 @@ class SQLEngine:
 
         if stmt.where is not None:
             pk_col = table._pk_column
-            if stmt.where.column == pk_col and stmt.where.op == "=":
+            if (
+                isinstance(stmt.where, Predicate)
+                and stmt.where.column == pk_col
+                and stmt.where.op == "="
+            ):
                 ok = table.delete(stmt.where.value)
                 affected = 1 if ok else 0
             else:
-                candidates = [r for r in table.select_all() if _matches(r, stmt.where)]
+                candidates = [r for r in table.select_all() if eval_condition(r, stmt.where)]
                 for row in candidates:
                     table.delete(row[pk_col])
                     affected += 1
@@ -182,19 +196,29 @@ class SQLEngine:
         return table
 
 
-# ── WHERE evaluation ─────────────────────────────────────────────────
+# ── Condition evaluation ──────────────────────────────────────────────
 
-def _matches(row: dict, where: WhereClause) -> bool:
-    """Return True if row satisfies the WHERE clause."""
-    val = row.get(where.column)
-    rhs = where.value
+def eval_condition(row: dict, cond: Condition) -> bool:
+    """Recursively evaluate a condition tree against a row."""
+    if isinstance(cond, Predicate):
+        return _eval_predicate(row, cond)
+    elif isinstance(cond, AndCondition):
+        return eval_condition(row, cond.left) and eval_condition(row, cond.right)
+    elif isinstance(cond, OrCondition):
+        return eval_condition(row, cond.left) or eval_condition(row, cond.right)
+    return False
 
-    # NULL comparisons
+
+def _eval_predicate(row: dict, pred: Predicate) -> bool:
+    val = row.get(pred.column)
+    rhs = pred.value
+
+    # NULL handling
     if val is None or rhs is None:
-        return (where.op == "=" and val is rhs) or (where.op == "!=" and val is not rhs)
+        return (pred.op == "=" and val is rhs) or (pred.op == "!=" and val is not rhs)
 
     try:
-        match where.op:
+        match pred.op:
             case "=":  return val == rhs
             case "!=": return val != rhs
             case "<":  return val < rhs

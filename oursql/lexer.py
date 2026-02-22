@@ -37,7 +37,10 @@ KEYWORDS: frozenset[str] = frozenset({
     "INT", "TEXT",
     "AND", "OR", "NOT",
     "NULL",
+    "ORDER", "BY", "ASC", "DESC",
+    "LIMIT",
 })
+
 
 # Multi-character symbols (order matters: longest first)
 _MULTI_SYMBOLS = ("<=", ">=", "!=", "<>")

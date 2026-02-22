@@ -1,0 +1,9 @@
+{
+  "users": {
+    "schema": {
+      "id": "int",
+      "name": "text"
+    },
+    "btree_order": 4
+  }
+}
