@@ -1,7 +1,7 @@
 # OurSQL
 
 **OurSQL** は、データベースエンジンの仕組みを「自分の手で作る」学習プロジェクトです。  
-Phase 1 では **B+Tree 主キーインデックス付きシングルテーブルエンジン** を Python で実装しています。
+B+Tree・ページング・SQLパーサまで一から実装しています。
 
 ## セットアップ
 
@@ -10,90 +10,155 @@ cd our-sql
 pip install -e ".[dev]"
 ```
 
-## Quick Start
+## REPL で使う（一番手軽）
+
+```bash
+# インメモリモード（終了すると消える）
+python -m oursql
+
+# ディスク永続モード（再起動後もデータが残る）
+python -m oursql --data-dir ./mydb
+```
+
+```
+OurSQL REPL  (mode=memory)  Type .help for help, .quit to exit.
+
+oursql> CREATE TABLE users (id INT, name TEXT);
+OK
+oursql> INSERT INTO users VALUES (1, 'Alice');
+oursql> INSERT INTO users VALUES (2, 'Bob');
+oursql> INSERT INTO users VALUES (3, 'Charlie');
+oursql> SELECT * FROM users;
++----+---------+
+| id | name    |
++----+---------+
+| 1  | Alice   |
+| 2  | Bob     |
+| 3  | Charlie |
++----+---------+
+(3 rows)
+oursql> SELECT * FROM users WHERE id > 1 AND id < 3;
++----+------+
+| id | name |
++----+------+
+| 2  | Bob  |
++----+------+
+(1 row)
+oursql> SELECT * FROM users ORDER BY name DESC LIMIT 2;
++----+---------+
+| id | name    |
++----+---------+
+| 3  | Charlie |
+| 2  | Bob     |
++----+---------+
+(2 rows)
+oursql> .tables
+  users
+oursql> .quit
+```
+
+### 使えるSQL
+
+| 文 | 例 |
+|----|----|
+| `CREATE TABLE` | `CREATE TABLE t (id INT, name TEXT)` |
+| `INSERT INTO` | `INSERT INTO t VALUES (1, 'Alice')` |
+| `SELECT` | `SELECT * FROM t` |
+| `SELECT ... WHERE` | `SELECT * FROM t WHERE id = 1` |
+| `AND / OR` | `WHERE id > 1 AND id < 5` |
+| `ORDER BY` | `ORDER BY name DESC` |
+| `LIMIT` | `LIMIT 10` |
+| `UPDATE` | `UPDATE t SET name = 'Bob' WHERE id = 1` |
+| `DELETE` | `DELETE FROM t WHERE id = 3` |
+| `DROP TABLE` | `DROP TABLE t` |
+
+### メタコマンド
+
+| コマンド | 説明 |
+|---------|------|
+| `.tables` | テーブル一覧 |
+| `.help` | ヘルプ表示 |
+| `.quit` | 終了 |
+
+---
+
+## Python API から使う
 
 ```python
 from oursql.db import OurSQLDB
+from oursql.engine import SQLEngine
 
-db = OurSQLDB()
-
-# テーブル作成（最初のカラムが主キー）
-users = db.create_table("users", {"id": "int", "name": "text"})
-
-# INSERT — データ保存 + B+Tree へ登録
-users.insert({"id": 1, "name": "Alice"})
-users.insert({"id": 2, "name": "Bob"})
-users.insert({"id": 3, "name": "Charlie"})
-
-# SELECT — B+Tree を辿って O(log n) で検索
-print(users.select(2))      # {"id": 2, "name": "Bob"}
-
-# UPDATE
-users.update(1, {"name": "Alicia"})
-print(users.select(1))      # {"id": 1, "name": "Alicia"}
-
-# DELETE
-users.delete(3)
-print(users.select(3))      # None
-
-# SELECT ALL — フルスキャン O(n)
-print(users.select_all())   # Alice と Bob の 2 件
-
-# 範囲スキャン — B+Tree のリーフリンクリストを活用
-users.insert({"id": 10, "name": "Dave"})
-users.insert({"id": 20, "name": "Eve"})
-users.insert({"id": 30, "name": "Frank"})
-print(users.select_range(10, 20))  # Dave と Eve の 2 件
+# ディスク永続モード
+with OurSQLDB("./mydb") as db:
+    engine = SQLEngine(db)
+    engine.execute("CREATE TABLE users (id INT, name TEXT)")
+    engine.execute("INSERT INTO users VALUES (1, 'Alice')")
+    rows = engine.execute("SELECT * FROM users WHERE id = 1")
+    print(rows)  # [{"id": 1, "name": "Alice"}]
 ```
 
 ## テスト実行
 
 ```bash
-pytest -v
+pytest -v   # 222 tests
 ```
 
 ## アーキテクチャ
 
 ```
-OurSQLDB
-└── OurSQLTable
-    ├── BPlusTree  (主キーインデックス: O(log n) 検索・挿入・削除)
-    └── HeapStorage (実データ保存: インメモリリスト + tombstone)
+SQL 文字列
+   │
+   ▼
+Lexer → Parser → AST
+                  │
+                  ▼
+              SQLEngine
+                  │
+              OurSQLDB
+             /        \
+   InMemoryTable    DiskTable
+   (Phase 1)        (Phase 2)
+   BPlusTree        PageBTree
+   HeapStorage      HeapFile + Pager
 ```
 
-### なぜ主キー検索は速いのか？
+### ディスク永続化のファイル構成
 
-`select(pk)` は **B+Tree を上から辿るだけ** なので O(log n)。  
-`select_all()` は HeapStorage を端から舐めるため O(n)（フルスキャン）。
-
-### なぜ INSERT でコストがかかるのか？
-
-データ保存だけでなく、B+Tree へのキー挿入とノード分割（スプリット）が発生するから。
+```
+./mydb/
+├── catalog.json        ← テーブル定義
+└── users/
+    ├── heap.db         ← 行データ（4KB ページ列）
+    └── pk.idx          ← B+Tree 主キーインデックス
+```
 
 ## ディレクトリ構成
 
 ```
 our-sql/
-├── docs/spec.md          # 詳細仕様書
 ├── oursql/
-│   ├── btree.py          # B+Tree
-│   ├── storage.py        # HeapStorage
-│   ├── table.py          # OurSQLTable
-│   └── db.py             # OurSQLDB
-└── tests/
-    ├── test_btree.py
-    ├── test_storage.py
-    ├── test_table.py
-    └── test_db.py
+│   ├── __main__.py     # REPL エントリポイント
+│   ├── lexer.py        # 字句解析器
+│   ├── parser.py       # 再帰下降パーサ / AST
+│   ├── engine.py       # SQL 実行エンジン
+│   ├── db.py           # OurSQLDB (DDL)
+│   ├── table.py        # InMemoryTable / DiskTable
+│   ├── btree.py        # B+Tree (in-memory)
+│   ├── storage.py      # HeapStorage (in-memory)
+│   ├── page_btree.py   # PageBTree (disk)
+│   ├── heap_file.py    # HeapFile (disk)
+│   ├── pager.py        # 4KB ページ I/O
+│   └── catalog.py      # テーブル定義の JSON 永続化
+└── tests/              # 222 tests
 ```
 
-## Phase ロードマップ
+## ロードマップ
 
-| Phase | テーマ |
-|-------|--------|
-| **1** (現在) | シングルテーブル + B+Tree インデックス |
-| 2 | ディスク永続化（ページ管理） |
-| 3 | SQL パーサ |
-| 4 | クエリオプティマイザ |
-| 5 | トランザクション & WAL |
-| 6 | マルチテーブル & JOIN |
+| Phase | テーマ | 状態 |
+|-------|--------|------|
+| 1 | シングルテーブル + B+Tree インデックス | ✅ 完了 |
+| 2 | ディスク永続化（ページ管理） | ✅ 完了 |
+| 3 | SQL パーサ（Lexer + Parser + Engine） | ✅ 完了 |
+| 4 | AND/OR、ORDER BY、LIMIT、REPL | ✅ 完了 |
+| 5 | トランザクション & WAL | 予定 |
+| 6 | JOIN & サブクエリ | 予定 |

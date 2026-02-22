@@ -1,47 +1,101 @@
-# OurSQL Phase 1 仕様書
+# OurSQL 仕様書
 
 ## 概要
 
-OurSQL は、データベースエンジンの仕組みを「自分の手で作る」ことで深く理解するための学習プロジェクトです。  
-Phase 1 では **シングルテーブル・エンジン** を Python で実装します。  
-B+Tree を主キーインデックスとして採用し、INSERT / SELECT / UPDATE / DELETE の基本操作を実現します。
+OurSQL は、データベースエンジンの仕組みを「自分の手で作る」学習プロジェクトです。  
+B+Tree・ページング・SQLパーサ・REPLを一から実装しています。
 
 ---
 
 ## ゴール・学習目的
 
-| 問い | Phase 1 で得られる答え |
+| 問い | OurSQL で得られる答え |
 |------|----------------------|
 | なぜ主キー検索は速いのか？ | B+Tree を辿るだけだから O(log n) |
 | なぜフルスキャンは遅いのか？ | Heap ストレージを端から舐めるから O(n) |
 | なぜ INSERT はインデックスがあると重くなるのか？ | データ保存 + B+Tree への挿入・ノード分割が走るから |
-| 削除はなぜ難しいのか？ | B+Tree のマージ・再配布が必要だから |
+| ディスクはどのようにデータを保管するのか？ | 固定サイズのページに行データをスロット管理で書き込む |
+| SQL 文はどのように実行されるのか？ | 字句解析 → 構文解析(AST) → 実行エンジン |
 
 ---
 
 ## アーキテクチャ
 
 ```
-┌─────────────────────────────────────────┐
-│              OurSQLDB                   │  ← DDL: create_table / drop_table
-│  ┌───────────────────────────────────┐  │
-│  │          OurSQLTable              │  │  ← DML: insert / select / update / delete
-│  │  ┌────────────┐  ┌─────────────┐ │  │
-│  │  │  BPlusTree │  │ HeapStorage │ │  │
-│  │  │ (主キーIdx) │  │ (実データ)  │ │  │
-│  │  └────────────┘  └─────────────┘ │  │
-│  └───────────────────────────────────┘  │
-└─────────────────────────────────────────┘
+SQL 文字列
+   │
+   ▼
+┌──────────┐     token列      ┌──────────┐     AST      ┌───────────┐
+│  Lexer   │ ──────────────► │  Parser  │ ───────────► │ SQLEngine │
+│(字句解析) │                  │(構文解析) │              │(実行エンジン)│
+└──────────┘                  └──────────┘              └─────┬─────┘
+                                                              │
+                                                        OurSQLDB
+                                                       /         \
+                                               InMemoryTable   DiskTable
+                                               (Phase 1)       (Phase 2)
+                                               BPlusTree       PageBTree
+                                               HeapStorage     HeapFile
+                                                               Pager
 ```
 
 ### コンポーネント一覧
 
 | コンポーネント | ファイル | 責務 |
 |--------------|---------|------|
-| `BPlusTree` | `oursql/btree.py` | 主キーの管理（挿入・検索・削除・範囲スキャン） |
-| `HeapStorage` | `oursql/storage.py` | 行データの保存（インメモリリスト + tombstone） |
-| `OurSQLTable` | `oursql/table.py` | B+Tree と HeapStorage を組み合わせたテーブル操作 |
-| `OurSQLDB` | `oursql/db.py` | 複数テーブルの管理（DDL） |
+| `Lexer` | `oursql/lexer.py` | SQL文字列→トークン列 |
+| `Parser` | `oursql/parser.py` | トークン列→AST（再帰下降） |
+| `SQLEngine` | `oursql/engine.py` | ASTを受け取り OurSQLDB を呼ぶ実行エンジン |
+| `OurSQLDB` | `oursql/db.py` | DDL管理。in-memory / disk 両モード |
+| `InMemoryTable` | `oursql/table.py` | BPlusTree + HeapStorage によるインメモリテーブル |
+| `DiskTable` | `oursql/table.py` | PageBTree + HeapFile によるディスクテーブル |
+| `BPlusTree` | `oursql/btree.py` | インメモリ B+Tree（主キーインデックス） |
+| `HeapStorage` | `oursql/storage.py` | インメモリ行ストレージ（tombstone方式） |
+| `PageBTree` | `oursql/page_btree.py` | ディスクB+Tree（各ノード=1ページ） |
+| `HeapFile` | `oursql/heap_file.py` | ページ+スロット方式の行ストレージ |
+| `Pager` | `oursql/pager.py` | 4KB固定長ページのファイルI/O |
+| `Catalog` | `oursql/catalog.py` | テーブル定義を `catalog.json` で永続化 |
+| REPL | `oursql/__main__.py` | `python -m oursql` で起動するインタラクティブシェル |
+
+---
+
+## サポートする SQL
+
+```sql
+-- DDL
+CREATE TABLE users (id INT, name TEXT);
+DROP TABLE users;
+
+-- DML
+INSERT INTO users VALUES (1, 'Alice');
+SELECT * FROM users;
+SELECT id, name FROM users WHERE id = 1;
+SELECT * FROM users WHERE id > 3 AND id < 8;
+SELECT * FROM users WHERE id = 1 OR id = 5;
+SELECT * FROM users ORDER BY name DESC;
+SELECT * FROM users ORDER BY id ASC LIMIT 10;
+UPDATE users SET name = 'Alicia' WHERE id = 1;
+DELETE FROM users WHERE id = 3;
+```
+
+### WHERE 条件演算子
+
+| 演算子 | 意味 |
+|--------|------|
+| `=` | 等しい |
+| `!=` / `<>` | 等しくない |
+| `<` | より小さい |
+| `>` | より大きい |
+| `<=` | 以下 |
+| `>=` | 以上 |
+
+### WHERE の論理結合（優先順位: AND > OR）
+
+```sql
+-- AND: id > 2 AND id < 6  →  [3, 4, 5]
+-- OR:  id = 1 OR id = 10  →  [1, 10]
+-- 混在: id = 1 OR id > 5 AND id < 8  →  id=1 OR (id>5 AND id<8)
+```
 
 ---
 
@@ -53,23 +107,25 @@ B+Tree を主キーインデックスとして採用し、INSERT / SELECT / UPDA
 schema = {
     "id":   "int",   # 主キー（必須・先頭カラム）
     "name": "text",
-    "age":  "int",
 }
 ```
 
-- 最初のカラムが主キー（PK）固定とする（Phase 1 の制約）
-- サポートする型: `int`, `text`（Phase 1）
+- 先頭カラムが主キー（固定）
+- サポートする型: `INT`（`int`）, `TEXT`（`text`）
 
-### 行データ（Row）
+### ディスクモードのファイル構成
 
-```python
-# dict 形式で表現
-row = {"id": 1, "name": "Alice", "age": 30}
+```
+data_dir/
+├── catalog.json        ← テーブル定義（スキーマ + btree_order）
+└── <table_name>/
+    ├── heap.db         ← 行データ（4KBページ列）
+    └── pk.idx          ← B+Treeインデックス（4KBページ列）
 ```
 
 ---
 
-## B+Tree 仕様
+## B+Tree 仕様（共通）
 
 ### パラメータ
 
@@ -77,126 +133,101 @@ row = {"id": 1, "name": "Alice", "age": 30}
 |-----------|------------|------|
 | `order` (t) | 4 | 各ノードが持てる最大キー数 = `2t - 1` |
 
-### ノード構造
-
-```python
-class BTreeNode:
-    keys: list        # ソート済みキーのリスト
-    values: list      # リーフノード時: row_id のリスト / 内部ノード時: 未使用
-    children: list    # 内部ノード時: 子ノードへのポインタ
-    is_leaf: bool
-    next: BTreeNode   # リーフ同士のリンク（範囲スキャン用）
-```
-
 ### 操作
 
-#### `insert(key, row_id)`
-1. ルートから適切なリーフを見つける
-2. リーフにキーを挿入
-3. ノードがオーバーフローしたら **分割（スプリット）**
-4. 分割が根まで伝播した場合、新しい根を生成
+| メソッド | 計算量 | 説明 |
+|---------|--------|------|
+| `insert(key, rid)` | O(log n) | キー挿入。オーバーフローでスプリット |
+| `search(key)` | O(log n) | キー検索 |
+| `delete(key)` | O(log n) | キー削除。アンダーフローで再配布/マージ |
+| `range_scan(start, end)` | O(log n + k) | リーフリンクリストを使った範囲スキャン |
 
-#### `search(key) → row_id | None`
-1. ルートから下りていき、リーフに到達
-2. リーフ内でキーを線形探索 → row_id を返す
-3. 見つからない場合は `None`
+### インメモリ版 vs ディスク版の違い
 
-#### `delete(key)`
-1. キーの存在するリーフを特定
-2. キーを削除
-3. アンダーフロー時は **再配布** または **マージ**
-4. マージが根まで伝播した場合、根を更新
-
-#### `range_scan(start_key, end_key) → list[row_id]`
-1. `start_key` のリーフを見つける
-2. リーフのリンクリストを辿りながら `end_key` まで収集
+| | `BPlusTree` | `PageBTree` |
+|-|-------------|-------------|
+| ストレージ | Python オブジェクト | 4KB ページファイル |
+| ポインタ | Python オブジェクト参照 | ページID (int) |
+| RID | `int` (HeapStorage の index) | `(page_id, slot_id)` |
+| 主キー型 | 任意 | `int` のみ（Phase 2 制約） |
 
 ---
 
-## HeapStorage 仕様
+## HeapFile / HeapStorage 仕様
 
-```python
-class HeapStorage:
-    _data: list[dict | None]  # row_id = インデックス、削除済みは None（tombstone）
+### HeapStorage（インメモリ）
+
+```
+_data: [row0, None, row2, ...]  ← None = tombstone（削除済み）
 ```
 
-### 操作
+### HeapFile（ディスク）
 
-| メソッド | 引数 | 戻り値 | 説明 |
-|---------|-----|-------|------|
-| `insert(row)` | `dict` | `int` (row_id) | リストに追加して row_id を返す |
-| `get(row_id)` | `int` | `dict \| None` | 行を返す（tombstone は None） |
-| `update(row_id, row)` | `int, dict` | `None` | 行を上書き |
-| `delete(row_id)` | `int` | `None` | tombstone（None）を設定 |
-| `scan()` | — | `list[dict]` | 全有効行をリストで返す |
+**1ページのレイアウト（4096 bytes）：**
+
+```
+[0:2]   num_slots    ← スロット数（uint16）
+[4:4+n*8]  slot_dir  ← (offset uint32, length uint32) × n
+[末尾から] row data   ← JSON エンコードされた行データ（逆方向に積む）
+```
+
+| メソッド | 説明 |
+|---------|------|
+| `insert(row)` | 空きスペースのあるページにJSONで書き込み。RID=(page_id, slot_id)を返す |
+| `get(page_id, slot_id)` | RIDから行を取得 |
+| `update(page_id, slot_id, row)` | インプレース更新（拡大は不可） |
+| `delete(page_id, slot_id)` | tombstone（offset=0, length=0）を設定 |
+| `scan()` | 全ページを舐めて有効行を返す |
 
 ---
 
-## OurSQLTable 仕様
+## SQL レイヤー仕様
 
-```python
-class OurSQLTable:
-    def __init__(self, name: str, schema: dict): ...
+### Lexer
 
-    def insert(self, row_data: dict) -> int:
-        """行を挿入し、row_id を返す"""
+- 入力: SQL 文字列
+- 出力: `list[Token]`
+- トークン種別: `KEYWORD` / `IDENT` / `NUMBER` / `STRING` / `SYMBOL` / `EOF`
+- `--` から行末はコメントとして無視
+- 文字列リテラルは `'...'`。`''` でシングルクォートをエスケープ
 
-    def select(self, pk_value) -> dict | None:
-        """主キーで 1 件検索"""
+### Parser
 
-    def select_all(self) -> list[dict]:
-        """全件取得（フルスキャン）"""
-
-    def update(self, pk_value, updates: dict) -> bool:
-        """主キーで行を特定して更新。成功したら True"""
-
-    def delete(self, pk_value) -> bool:
-        """主キーで行を特定して削除。成功したら True"""
-```
-
-### insert の流れ
+再帰下降パーサ。文法（重要部分）：
 
 ```
-insert({"id": 5, "name": "Bob"})
-   │
-   ├─① HeapStorage.insert(row) → row_id = 3
-   │
-   └─② BPlusTree.insert(pk=5, row_id=3)
-              │
-              └─ ノードがあふれたら「パッカーン！」（スプリット）
+condition  = and_cond (OR and_cond)*
+and_cond   = predicate (AND predicate)*
+predicate  = IDENT op literal
+select     = SELECT col_list FROM IDENT
+             [WHERE condition]
+             [ORDER BY IDENT [ASC|DESC]]
+             [LIMIT NUMBER]
 ```
 
-### select の流れ
+ASTノード: `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStmt`, `Predicate`, `AndCondition`, `OrCondition`
 
-```
-select(pk=5)
-   │
-   ├─① BPlusTree.search(5) → row_id = 3   ← O(log n)
-   │
-   └─② HeapStorage.get(3) → {"id":5, "name":"Bob"}
-```
+### SQLEngine の実行最適化
 
-### フルスキャンとの比較
-
-```
-select_all()
-   └─ HeapStorage.scan() → 全行を端から舐める  ← O(n)
-```
+- `WHERE pk = value` → B+Tree のインデックスルックアップを使用（O(log n)）
+- それ以外の WHERE → フルスキャン後にフィルタリング（O(n)）
+- `ORDER BY` → Python の `list.sort()` をインメモリで実行
+- `LIMIT` → ソート後にスライス
 
 ---
 
-## OurSQLDB 仕様
+## OurSQLDB の2モード
 
 ```python
-class OurSQLDB:
-    def create_table(self, name: str, schema: dict) -> OurSQLTable:
-        """テーブルを作成して返す"""
+# インメモリモード（Phase 1 互換）
+db = OurSQLDB()
 
-    def get_table(self, name: str) -> OurSQLTable | None:
-        """テーブルを取得"""
+# ディスク永続モード（Phase 2）
+db = OurSQLDB("./data")
 
-    def drop_table(self, name: str) -> bool:
-        """テーブルを削除"""
+# context manager で使うと自動で close()
+with OurSQLDB("./data") as db:
+    ...
 ```
 
 ---
@@ -206,43 +237,46 @@ class OurSQLDB:
 ```
 our-sql/
 ├── docs/
-│   └── spec.md           # この仕様書
+│   └── spec.md             # この仕様書
 ├── oursql/
+│   ├── __main__.py         # REPL (python -m oursql)
 │   ├── __init__.py
-│   ├── btree.py          # B+Tree
-│   ├── storage.py        # HeapStorage
-│   ├── table.py          # OurSQLTable
-│   └── db.py             # OurSQLDB
-├── tests/
-│   ├── test_btree.py
-│   ├── test_storage.py
-│   ├── test_table.py
-│   └── test_db.py
-├── README.md
-└── pyproject.toml        # pytest などの依存管理
+│   ├── lexer.py            # Lexer: SQL文字列 → トークン列
+│   ├── parser.py           # Parser: トークン列 → AST
+│   ├── engine.py           # SQLEngine: AST → 実行
+│   ├── db.py               # OurSQLDB: DDL + デュアルモード
+│   ├── table.py            # InMemoryTable / DiskTable
+│   ├── btree.py            # BPlusTree (in-memory)
+│   ├── storage.py          # HeapStorage (in-memory)
+│   ├── page_btree.py       # PageBTree (disk)
+│   ├── heap_file.py        # HeapFile (disk)
+│   ├── pager.py            # Pager: 4KBページI/O
+│   └── catalog.py          # Catalog: テーブル定義の永続化
+└── tests/
+    ├── test_btree.py
+    ├── test_storage.py
+    ├── test_table.py
+    ├── test_db.py
+    ├── test_pager.py
+    ├── test_heap_file.py
+    ├── test_page_btree.py
+    ├── test_persistence.py
+    ├── test_lexer.py
+    ├── test_parser.py
+    ├── test_engine.py
+    ├── test_engine_disk.py
+    └── test_engine_extended.py
 ```
 
 ---
 
-## Phase 1 制約事項（スコープ外）
+## ロードマップ
 
-以下は Phase 1 では実装しない（将来の Phase で扱う）
-
-- SQL パーサ（文字列解析）
-- ファイルへの永続化（ディスク I/O）
-- トランザクション / MVCC
-- セカンダリインデックス
-- 複合主キー
-- 結合（JOIN）
-
----
-
-## 将来フェーズのロードマップ（概略）
-
-| Phase | テーマ |
-|-------|--------|
-| 2 | ディスク永続化（ページ・スロット管理） |
-| 3 | SQL パーサ（字句解析 → 構文木） |
-| 4 | クエリオプティマイザ（コストベース） |
-| 5 | トランザクション & WAL |
-| 6 | マルチテーブル & JOIN |
+| Phase | テーマ | 状態 |
+|-------|--------|------|
+| 1 | シングルテーブル + B+Tree インデックス | ✅ 完了 |
+| 2 | ディスク永続化（ページ・スロット管理） | ✅ 完了 |
+| 3 | SQL パーサ（Lexer + Parser + Engine） | ✅ 完了 |
+| 4 | AND/OR、ORDER BY、LIMIT、REPL | ✅ 完了 |
+| 5 | トランザクション & WAL | 予定 |
+| 6 | JOIN & サブクエリ | 予定 |
