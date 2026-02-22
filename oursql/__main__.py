@@ -10,6 +10,7 @@ Meta-commands:
     .help    — show help
     .tables  — list tables
     .quit    — exit
+    exit     — exit (also: quit, .exit, .quit)
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ def _fmt_table(rows: list[dict]) -> str:
 
 def run_repl(engine: SQLEngine, db: OurSQLDB) -> None:
     mode = "disk" if db._disk_mode else "memory"
-    print(f"OurSQL REPL  (mode={mode})  Type .help for help, .quit to exit.")
+    print(f"OurSQL REPL  (mode={mode})  Type .help for help, exit or .quit to exit.")
     print()
 
     buf: list[str] = []
@@ -64,6 +65,11 @@ def run_repl(engine: SQLEngine, db: OurSQLDB) -> None:
             break
 
         stripped = line.strip()
+
+        # Plain exit/quit commands (without dot prefix)
+        if not buf and stripped.lower() in ("exit", "quit"):
+            print("Bye!")
+            sys.exit(0)
 
         # Meta-commands (only at top level)
         if not buf and stripped.startswith("."):
@@ -105,7 +111,7 @@ def _handle_meta(cmd: str, db: OurSQLDB) -> None:
 Meta-commands:
   .tables   List all tables
   .help     Show this help
-  .quit     Exit
+  .quit     Exit  (also: exit, quit, .exit)
 
 SQL examples:
   CREATE TABLE users (id INT, name TEXT);
